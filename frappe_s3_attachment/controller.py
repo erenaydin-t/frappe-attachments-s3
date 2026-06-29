@@ -1,5 +1,3 @@
-from __future__ import unicode_literals
-
 import datetime
 import os
 import random
@@ -28,14 +26,16 @@ class S3Operations(object):
             'S3 File Attachment',
             'S3 File Attachment',
         )
-        if (
-            self.s3_settings_doc.aws_key and
-            self.s3_settings_doc.aws_secret
-        ):
+        aws_key = self.s3_settings_doc.aws_key
+        aws_secret = (
+            self.s3_settings_doc.get_password('aws_secret')
+            if self.s3_settings_doc.get('aws_secret') else None
+        )
+        if aws_key and aws_secret:
             self.S3_CLIENT = boto3.client(
                 's3',
-                aws_access_key_id=self.s3_settings_doc.aws_key,
-                aws_secret_access_key=self.s3_settings_doc.aws_secret,
+                aws_access_key_id=aws_key,
+                aws_secret_access_key=aws_secret,
                 region_name=self.s3_settings_doc.region_name,
                 config=Config(signature_version='s3v4')
             )
@@ -110,32 +110,33 @@ class S3Operations(object):
         mime_type = magic.from_file(file_path, mime=True)
         key = self.key_generator(file_name, parent_doctype, parent_name)
         content_type = mime_type
+        extra_args = {
+            "ContentType": content_type,
+            "Metadata": {
+                "ContentType": content_type,
+                "file_name": file_name,
+            },
+        }
+        if not is_private:
+            extra_args["ACL"] = "public-read"
         try:
-            if is_private:
-                self.S3_CLIENT.upload_file(
-                    file_path, self.BUCKET, key,
-                    ExtraArgs={
-                        "ContentType": content_type,
-                        "Metadata": {
-                            "ContentType": content_type,
-                            "file_name": file_name
-                        }
-                    }
-                )
-            else:
-                self.S3_CLIENT.upload_file(
-                    file_path, self.BUCKET, key,
-                    ExtraArgs={
-                        "ContentType": content_type,
-                        "ACL": 'public-read',
-                        "Metadata": {
-                            "ContentType": content_type,
-
-                        }
-                    }
-                )
-
+            self.S3_CLIENT.upload_file(
+                file_path, self.BUCKET, key, ExtraArgs=extra_args
+            )
         except boto3.exceptions.S3UploadFailedError:
+            # Buckets created with "Bucket owner enforced" object ownership
+            # (the AWS default since April 2023) have ACLs disabled, so a
+            # public-read upload is rejected. Retry once without the ACL; the
+            # object is then served via the bucket policy / presigned URL.
+            if "ACL" in extra_args:
+                extra_args.pop("ACL")
+                try:
+                    self.S3_CLIENT.upload_file(
+                        file_path, self.BUCKET, key, ExtraArgs=extra_args
+                    )
+                    return key
+                except boto3.exceptions.S3UploadFailedError:
+                    pass
             frappe.throw(frappe._("File Upload Failed. Please try again."))
         return key
 
