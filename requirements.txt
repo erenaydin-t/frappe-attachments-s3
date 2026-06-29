@@ -1,2 +1,2 @@
-python-magic==0.4.18
+python-magic>=0.4.27
 boto3>=1.34.0
