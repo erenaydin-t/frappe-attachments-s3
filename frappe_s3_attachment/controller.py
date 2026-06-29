@@ -4,6 +4,8 @@ import random
 import re
 import string
 
+from urllib.parse import quote
+
 import boto3
 
 from botocore.client import Config
@@ -118,11 +120,14 @@ class S3Operations:
         mime_type = magic.from_file(file_path, mime=True)
         key = self.key_generator(file_name, parent_doctype, parent_name)
         content_type = mime_type
+        # S3 object metadata must be ASCII-only, so percent-encode the file
+        # name (it may contain non-ASCII characters, e.g. Persian/Arabic).
+        # It is decoded again when building the download Content-Disposition.
         extra_args = {
             "ContentType": content_type,
             "Metadata": {
                 "ContentType": content_type,
-                "file_name": file_name,
+                "file_name": quote(file_name),
             },
         }
         if not is_private:
@@ -201,7 +206,15 @@ class S3Operations:
 
         }
         if file_name:
-            params['ResponseContentDisposition'] = 'filename={}'.format(file_name)
+            # RFC 5987: use filename* with UTF-8 percent-encoding so non-ASCII
+            # names (e.g. Persian/Arabic) download with the correct file name,
+            # with a plain ASCII filename= fallback for older clients.
+            ascii_name = file_name.encode('ascii', 'ignore').decode() or 'file'
+            params['ResponseContentDisposition'] = (
+                "inline; filename=\"{0}\"; filename*=UTF-8''{1}".format(
+                    ascii_name, quote(file_name)
+                )
+            )
 
         url = self.S3_CLIENT.generate_presigned_url(
             'get_object',
