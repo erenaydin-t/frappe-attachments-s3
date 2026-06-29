@@ -27,6 +27,7 @@
    "label": "General Configuration"
   },
   {
+   "description": "When enabled, deleting a file in ERPNext also permanently removes the object from the S3 bucket. When left unchecked (default), the file is removed from ERPNext but the copy in the bucket is kept.",
    "fieldname": "delete_file_from_cloud",
    "fieldtype": "Check",
    "label": "Delete file from cloud"
@@ -83,6 +84,7 @@
    "fieldtype": "Section Break"
   },
   {
+   "description": "Uploads every file currently stored locally (public and private) to S3 and rewrites its link. Run once after entering the credentials. Files already on S3 are skipped, and each local copy is deleted only after it uploads successfully.",
    "fieldname": "migrate_existing_files",
    "fieldtype": "Button",
    "label": "Migrate Existing Files"

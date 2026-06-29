@@ -145,7 +145,14 @@ class S3Operations:
                     return key
                 except boto3.exceptions.S3UploadFailedError:
                     pass
-            frappe.throw(frappe._("File Upload Failed. Please try again."))
+            frappe.throw(
+                frappe._(
+                    "File upload to cloud storage failed. Check the Bucket "
+                    "Name, AWS Key/Secret, Region and Endpoint URL in S3 File "
+                    "Attachment settings, then try again."
+                ),
+                title=frappe._("Cloud Upload Failed"),
+            )
         return key
 
     def delete_from_s3(self, key):
@@ -156,8 +163,20 @@ class S3Operations:
                     Bucket=self.s3_settings_doc.bucket_name,
                     Key=key
                 )
-            except ClientError:
-                frappe.throw(frappe._("Access denied: Could not delete file"))
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code", "")
+                # The object is already gone — the desired end state (no copy
+                # in the cloud) is met, so let the File record be deleted.
+                if code in ("404", "NoSuchKey"):
+                    return
+                frappe.throw(
+                    frappe._(
+                        "Could not delete this file from cloud storage ({0}). "
+                        "Check the credentials and bucket permissions in S3 "
+                        "File Attachment settings."
+                    ).format(code or "error"),
+                    title=frappe._("Cloud Delete Failed"),
+                )
 
     def read_file_from_s3(self, key):
         """
@@ -296,9 +315,61 @@ def generate_file(key=None, file_name=None):
             )
 
     s3_upload = S3Operations()
+    # Confirm the object still exists before redirecting, so the user gets a
+    # clear message instead of an opaque S3 XML error page in the browser.
+    try:
+        s3_upload.S3_CLIENT.head_object(Bucket=s3_upload.BUCKET, Key=key)
+    except ClientError as e:
+        _throw_s3_error(e, action=frappe._("read this file from"))
+
     signed_url = s3_upload.get_url(key, file_name)
     frappe.local.response["type"] = "redirect"
     frappe.local.response["location"] = signed_url
+
+
+def _throw_s3_error(error, action):
+    """
+    Translate a botocore ClientError into a clear, user-facing message.
+
+    `action` is a short phrase such as "read this file from" or "delete this
+    file from" that is woven into the message.
+    """
+    code = ""
+    if hasattr(error, "response"):
+        code = error.response.get("Error", {}).get("Code", "")
+
+    if code in ("404", "NoSuchKey"):
+        frappe.throw(
+            frappe._(
+                "This file is no longer available in cloud storage. "
+                "It may have been deleted directly from the bucket."
+            ),
+            title=frappe._("File Not Found in Cloud"),
+        )
+    elif code == "NoSuchBucket":
+        frappe.throw(
+            frappe._(
+                "The configured S3 bucket does not exist. Check the Bucket "
+                "Name in S3 File Attachment settings."
+            ),
+            title=frappe._("Bucket Not Found"),
+        )
+    elif code in (
+        "403", "AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch"
+    ):
+        frappe.throw(
+            frappe._(
+                "Access to cloud storage was denied. Check the AWS Key, AWS "
+                "Secret, Region and Endpoint URL in S3 File Attachment settings."
+            ),
+            title=frappe._("Cloud Storage Access Denied"),
+        )
+    else:
+        frappe.throw(
+            frappe._("Could not {0} cloud storage: {1}").format(
+                action, code or str(error)
+            )
+        )
 
 
 def upload_existing_files_s3(name):
