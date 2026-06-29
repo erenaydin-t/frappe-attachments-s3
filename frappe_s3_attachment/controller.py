@@ -31,20 +31,28 @@ class S3Operations:
             self.s3_settings_doc.get_password('aws_secret')
             if self.s3_settings_doc.get('aws_secret') else None
         )
+
+        # Optional custom endpoint for S3-compatible providers (ArvanCloud,
+        # MinIO, Wasabi, DigitalOcean Spaces, ...). Blank means plain AWS S3.
+        endpoint_url = self.s3_settings_doc.get('endpoint_url') or None
+        config = Config(
+            signature_version='s3v4',
+            # Path-style addressing ({endpoint}/{bucket}/{key}) is the most
+            # portable across S3-compatible providers; AWS keeps its default
+            # auto/virtual-hosted behaviour when no endpoint is set.
+            s3={'addressing_style': 'path'} if endpoint_url else {},
+        )
+        client_args = {
+            'region_name': self.s3_settings_doc.region_name,
+            'config': config,
+        }
+        if endpoint_url:
+            client_args['endpoint_url'] = endpoint_url
         if aws_key and aws_secret:
-            self.S3_CLIENT = boto3.client(
-                's3',
-                aws_access_key_id=aws_key,
-                aws_secret_access_key=aws_secret,
-                region_name=self.s3_settings_doc.region_name,
-                config=Config(signature_version='s3v4')
-            )
-        else:
-            self.S3_CLIENT = boto3.client(
-                's3',
-                region_name=self.s3_settings_doc.region_name,
-                config=Config(signature_version='s3v4')
-            )
+            client_args['aws_access_key_id'] = aws_key
+            client_args['aws_secret_access_key'] = aws_secret
+
+        self.S3_CLIENT = boto3.client('s3', **client_args)
         self.BUCKET = self.s3_settings_doc.bucket_name
         self.folder_name = self.s3_settings_doc.folder_name
 
