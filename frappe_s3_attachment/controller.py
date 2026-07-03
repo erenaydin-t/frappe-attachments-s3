@@ -274,14 +274,18 @@ def file_upload_to_s3(doc, method):
 
     if doc.is_private:
         method = "frappe_s3_attachment.controller.generate_file"
+        # The key (and file name) can contain spaces and other characters that
+        # are unsafe in a URL query string — e.g. the parent doctype "Raven
+        # Message" puts a space in the key. Percent-encode both so the stored
+        # file_url stays a valid URL and the key round-trips back unchanged.
         file_url = "/api/method/{0}?key={1}&file_name={2}".format(
-            method, key, doc.file_name
+            method, quote(key), quote(doc.file_name)
         )
     else:
         file_url = '{}/{}/{}'.format(
             s3_upload.S3_CLIENT.meta.endpoint_url,
             s3_upload.BUCKET,
-            key
+            quote(key)
         )
 
     os.remove(file_path)
@@ -408,14 +412,16 @@ def upload_existing_files_s3(name):
 
     if doc.is_private:
         method = "frappe_s3_attachment.controller.generate_file"
+        # See file_upload_to_s3: percent-encode so keys containing spaces or
+        # other unsafe characters survive as a valid URL query string.
         file_url = "/api/method/{0}?key={1}&file_name={2}".format(
-            method, key, doc.file_name
+            method, quote(key), quote(doc.file_name)
         )
     else:
         file_url = '{}/{}/{}'.format(
             s3_upload.S3_CLIENT.meta.endpoint_url,
             s3_upload.BUCKET,
-            key
+            quote(key)
         )
 
     # Remove file from local.
