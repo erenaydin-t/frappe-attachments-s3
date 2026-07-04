@@ -49,6 +49,25 @@ Frappe app to make file upload automatically upload and read from s3.
 - Files already on S3 are skipped, so it is safe to re-run (e.g. after adding more files).
 - Run it once after you have entered and saved the credentials.
 
+#### Advanced: `site_config.json` options.
+
+- **`ignore_s3_upload_for_doctype`** — list of parent doctypes whose attachments should
+  never be offloaded to S3 (kept local). Defaults to `["Data Import"]`.
+- **`s3_defer_upload_for_doctype`** — list of parent doctypes whose S3 offload is deferred
+  to a background job that runs *after the upload request commits*, instead of happening
+  synchronously in the `File` hook. Defaults to `["Raven Message"]`.
+
+  Some apps read the just-uploaded file from the local disk immediately after it is
+  created. Raven, for example, computes image dimensions via Frappe's `get_local_image()`,
+  which needs the original `/files` path and the local bytes. Offloading to S3 and deleting
+  the local copy synchronously breaks that read with *"Unable to read file format"*.
+  Deferring lets the local read succeed first; the background job then uploads to S3,
+  rewrites the `File`'s `file_url`, and repoints the parent document's file reference at the
+  new S3-backed URL.
+
+  > Requires a running background worker (`bench worker`). There is a brief window after
+  > upload where the file is still served locally before the job moves it to S3.
+
 #### What changes for end users (UI side effects).
 
 - **Uploading:** unchanged — users attach files the normal way. Behind the scenes the file

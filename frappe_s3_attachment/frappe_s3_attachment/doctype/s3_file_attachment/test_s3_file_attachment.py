@@ -51,3 +51,40 @@ class TestS3FileAttachment(unittest.TestCase):
 	def test_is_s3_uploadable_accepts_local_private(self):
 		doc = frappe._dict({"is_folder": 0, "file_url": "/private/files/x.png"})
 		self.assertTrue(controller.is_s3_uploadable(doc))
+
+	_UNSET = object()
+
+	def _set_defer_conf(self, value):
+		"""Set s3_defer_upload_for_doctype in conf, restoring it on cleanup."""
+		previous = frappe.local.conf.get("s3_defer_upload_for_doctype", self._UNSET)
+
+		def restore():
+			if previous is self._UNSET:
+				frappe.local.conf.pop("s3_defer_upload_for_doctype", None)
+			else:
+				frappe.local.conf["s3_defer_upload_for_doctype"] = previous
+
+		self.addCleanup(restore)
+		if value is self._UNSET:
+			frappe.local.conf.pop("s3_defer_upload_for_doctype", None)
+		else:
+			frappe.local.conf["s3_defer_upload_for_doctype"] = value
+
+	def test_deferred_doctypes_default(self):
+		self._set_defer_conf(self._UNSET)
+		self.assertEqual(
+			controller._deferred_upload_doctypes(), ["Raven Message"]
+		)
+
+	def test_deferred_doctypes_string_config(self):
+		self._set_defer_conf("Raven Message")
+		self.assertEqual(
+			controller._deferred_upload_doctypes(), ["Raven Message"]
+		)
+
+	def test_deferred_doctypes_list_config(self):
+		self._set_defer_conf(["Raven Message", "Custom DocType"])
+		self.assertEqual(
+			controller._deferred_upload_doctypes(),
+			["Raven Message", "Custom DocType"],
+		)

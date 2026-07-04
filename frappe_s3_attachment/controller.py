@@ -249,24 +249,16 @@ def is_s3_uploadable(doc):
     return True
 
 
-@frappe.whitelist()
-def file_upload_to_s3(doc, method):
+def _push_to_s3(doc, file_path):
     """
-    Upload a freshly created File to S3 and rewrite its file_url.
+    Upload a local file to S3, delete the local copy, and return
+    ``(key, file_url)`` for the stored object.
+
+    Shared by the synchronous, deferred and migration upload paths so the
+    key/URL-building rules live in exactly one place.
     """
     parent_doctype = doc.attached_to_doctype or 'File'
     parent_name = doc.attached_to_name
-    ignore_s3_upload_for_doctype = frappe.local.conf.get(
-        'ignore_s3_upload_for_doctype') or ['Data Import']
-    if parent_doctype in ignore_s3_upload_for_doctype:
-        return
-    if not is_s3_uploadable(doc) or not is_s3_configured():
-        return
-
-    file_path = doc.get_full_path()
-    if not os.path.exists(file_path):
-        return
-
     s3_upload = S3Operations()
     key = s3_upload.upload_files_to_s3_with_key(
         file_path, doc.file_name, doc.is_private, parent_doctype, parent_name
@@ -289,6 +281,102 @@ def file_upload_to_s3(doc, method):
         )
 
     os.remove(file_path)
+    return key, file_url
+
+
+def _deferred_upload_doctypes():
+    """
+    Parent doctypes whose freshly-uploaded file is read from the *local* disk
+    immediately after this hook runs, and therefore must not be offloaded to
+    S3 synchronously.
+
+    Raven Message is the canonical case: on save it computes image dimensions
+    via frappe's ``get_local_image()``, which needs both the local file and the
+    original ``/files`` URL. If we upload to S3 and delete the local copy here,
+    that read fails with "Unable to read file format". Deferring the offload to
+    a background job (after the request commits) lets the local read succeed
+    first. Configurable via ``s3_defer_upload_for_doctype`` in site_config.json.
+    """
+    configured = frappe.local.conf.get("s3_defer_upload_for_doctype")
+    if configured is None:
+        return ["Raven Message"]
+    if isinstance(configured, str):
+        return [configured]
+    return configured
+
+
+def _repoint_parent_references(parent_doctype, parent_name, old_url, new_url):
+    """
+    After a deferred offload rewrites a File's ``file_url``, update the parent
+    document's field(s) that still hold the old local URL (e.g. Raven
+    Message.file) so the attachment keeps resolving to the S3-backed URL.
+    """
+    if not (parent_doctype and parent_name and old_url and old_url != new_url):
+        return
+    if not frappe.db.exists(parent_doctype, parent_name):
+        return
+
+    meta = frappe.get_meta(parent_doctype)
+    candidate_fields = {
+        df.fieldname for df in meta.fields
+        if df.fieldtype in ("Attach", "Attach Image", "Data", "Small Text")
+    }
+    image_field = meta.get("image_field")
+    if image_field:
+        candidate_fields.add(image_field)
+    if not candidate_fields:
+        return
+
+    current = frappe.db.get_value(
+        parent_doctype, parent_name, list(candidate_fields), as_dict=True
+    ) or {}
+    to_update = {
+        field: new_url for field in candidate_fields
+        if current.get(field) == old_url
+    }
+    # Preserve the pre-existing behaviour of always pointing the designated
+    # image field at the file, even if it was previously empty.
+    if image_field:
+        to_update[image_field] = new_url
+    if to_update:
+        frappe.db.set_value(
+            parent_doctype, parent_name, to_update, update_modified=False
+        )
+
+
+@frappe.whitelist()
+def file_upload_to_s3(doc, method):
+    """
+    Upload a freshly created File to S3 and rewrite its file_url.
+    """
+    parent_doctype = doc.attached_to_doctype or 'File'
+    parent_name = doc.attached_to_name
+    ignore_s3_upload_for_doctype = frappe.local.conf.get(
+        'ignore_s3_upload_for_doctype') or ['Data Import']
+    if parent_doctype in ignore_s3_upload_for_doctype:
+        return
+    if not is_s3_uploadable(doc) or not is_s3_configured():
+        return
+
+    # Some doctypes read the just-uploaded file from local disk right after
+    # this hook (see _deferred_upload_doctypes). For those, hand the offload to
+    # a background job that runs once the current request has committed — by
+    # which time the local read has already happened — instead of deleting the
+    # local file out from under it here.
+    if parent_doctype in _deferred_upload_doctypes():
+        frappe.enqueue(
+            "frappe_s3_attachment.controller.upload_file_to_s3_deferred",
+            queue="short",
+            enqueue_after_commit=True,
+            name=doc.name,
+        )
+        return
+
+    file_path = doc.get_full_path()
+    if not os.path.exists(file_path):
+        return
+
+    key, file_url = _push_to_s3(doc, file_path)
     # Store the S3 object key in content_hash so the file can be located again
     # for presigned downloads, permission checks and deletion.
     doc.db_set(
@@ -303,6 +391,41 @@ def file_upload_to_s3(doc, method):
     if image_field and parent_name:
         frappe.db.set_value(parent_doctype, parent_name, image_field, file_url)
 
+    frappe.db.commit()
+
+
+def upload_file_to_s3_deferred(name):
+    """
+    Background job: offload a File to S3 after the request that created it has
+    committed, so local-image readers (e.g. Raven's dimension calculation) have
+    already read the still-local file.
+
+    Idempotent: ``is_s3_uploadable`` skips files that have already been moved to
+    S3, so a re-run (or a duplicate enqueue) is a no-op.
+    """
+    if not frappe.db.exists("File", name):
+        return
+    doc = frappe.get_doc("File", name)
+    if not is_s3_uploadable(doc) or not is_s3_configured():
+        return
+
+    file_path = doc.get_full_path()
+    if not os.path.exists(file_path):
+        return
+
+    parent_doctype = doc.attached_to_doctype or 'File'
+    parent_name = doc.attached_to_name
+    old_file_url = doc.file_url
+
+    key, file_url = _push_to_s3(doc, file_path)
+    doc.db_set(
+        {"file_url": file_url, "content_hash": key}, update_modified=False
+    )
+    # The parent (e.g. Raven Message) stored the old local URL while we were
+    # deferring; repoint it at the S3-backed URL now that the offload is done.
+    _repoint_parent_references(
+        parent_doctype, parent_name, old_file_url, file_url
+    )
     frappe.db.commit()
 
 
@@ -403,29 +526,7 @@ def upload_existing_files_s3(name):
     if not os.path.exists(file_path):
         return
 
-    parent_doctype = doc.attached_to_doctype or 'File'
-    parent_name = doc.attached_to_name
-    s3_upload = S3Operations()
-    key = s3_upload.upload_files_to_s3_with_key(
-        file_path, doc.file_name, doc.is_private, parent_doctype, parent_name
-    )
-
-    if doc.is_private:
-        method = "frappe_s3_attachment.controller.generate_file"
-        # See file_upload_to_s3: percent-encode so keys containing spaces or
-        # other unsafe characters survive as a valid URL query string.
-        file_url = "/api/method/{0}?key={1}&file_name={2}".format(
-            method, quote(key), quote(doc.file_name)
-        )
-    else:
-        file_url = '{}/{}/{}'.format(
-            s3_upload.S3_CLIENT.meta.endpoint_url,
-            s3_upload.BUCKET,
-            quote(key)
-        )
-
-    # Remove file from local.
-    os.remove(file_path)
+    key, file_url = _push_to_s3(doc, file_path)
     doc.db_set(
         {"file_url": file_url, "content_hash": key}, update_modified=False
     )
